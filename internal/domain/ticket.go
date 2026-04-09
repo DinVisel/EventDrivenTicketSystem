@@ -1,6 +1,10 @@
 package domain
 
-import "context"
+import (
+	"context"
+
+	"github.com/go-redsync/redsync/v4"
+)
 
 type Ticket struct {
 	ID        int    `json:"id"`
@@ -13,6 +17,7 @@ type TicketRepository interface {
 	UpdateStockDB(ctx context.Context, id int, quantity int) error
 	DecrementStockCache(ctx context.Context, id int) (int64, error)
 	SyncCacheWithDB(ctx context.Context, id int) error
+	AcquireLock(ctx context.Context, resourceId string) (*redsync.Mutex, error)
 }
 
 type TicketService interface {
