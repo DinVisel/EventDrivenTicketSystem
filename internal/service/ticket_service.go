@@ -22,6 +22,17 @@ func NewTicketService(repo domain.TicketRepository, ch *amqp.Channel) domain.Tic
 }
 
 func (s *ticketService) Purchase(ctx context.Context, ticketID int) error {
+	resourceID := fmt.Sprintf("ticket:%d", ticketID)
+
+	//Lock the door with redlock
+	mutex, err := s.repo.AcquireLock(ctx, resourceID)
+	if err != nil {
+		return fmt.Errorf("Process busy now. Please try again later: %w", err)
+	}
+
+	//Guarantee unlocking after process (even if there occurs an error)
+	defer mutex.Unlock()
+
 	// try decreasing quickly from Redis
 	newStock, err := s.repo.DecrementStockCache(ctx, ticketID)
 	if err != nil {
