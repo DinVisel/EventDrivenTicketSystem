@@ -13,7 +13,7 @@ type TicketHandler struct {
 	service domain.TicketService
 }
 
-func NewHandler(s domain.TicketService) *TicketHandler {
+func NewTicketHandler(s domain.TicketService) *TicketHandler {
 	return &TicketHandler{service: s}
 }
 

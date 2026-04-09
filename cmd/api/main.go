@@ -6,91 +6,86 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	"github.com/DinVisel/EventDrivenTicketSystem/internal/handler"
+	"github.com/DinVisel/EventDrivenTicketSystem/internal/repository"
+	"github.com/DinVisel/EventDrivenTicketSystem/internal/service"
+	"github.com/DinVisel/EventDrivenTicketSystem/internal/worker"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/lib/pq"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 )
 
-var (
-	db       *sql.DB
-	rdb      *redis.Client
-	amqpChan *amqp.Channel
-	ctx      = context.Background()
-)
-
 func main() {
-	// DB redis connection
-	initDBAndRedis()
+	// Infanstructure connections
+	ctx := context.Background()
 
-	// RabbitMQ connection
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	// PostgreSQL
+	db, err := sql.Open("postgres", "postgres://user:password@localhost:5434/ticket_db?sslmode=disable")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("DB connection error: ", err)
 	}
-	defer conn.Close()
 
-	amqpChan, err = conn.Channel()
+	// Redis
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+	// RabbitMQ
+	amqpConn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("RabbitMQ connection error: ", err)
 	}
-	defer amqpChan.Close()
+	amqpChan, _ := amqpConn.Channel()
+	amqpChan.QueueDeclare("ticket_queue", true, false, false, false, nil)
 
-	// Define queue
-	_, err = amqpChan.QueueDeclare("ticket_queue", true, false, false, false, nil)
+	// Connect layers with each other
+	repo := repository.NewTicketRepository(db, rdb)
+	svc := service.NewTicketService(repo, amqpChan)
+	hdl := handler.NewTicketHandler(svc)
+	wrk := worker.NewTicketWorker(repo, amqpChan)
 
-	// Start worker
-	go startDBWorker()
+	// Initial settings
+	// Sync db and redis
+	repo.SyncCacheWithDB(ctx, 100)
 
+	// Start worker in background
+	go wrk.Start(ctx)
+
+	// Routing
 	r := chi.NewRouter()
-	r.Post("/buy", buyWithQueue)
+	r.Use(middleware.Logger)
+	r.Post("/buy/{ticketID}", hdl.BuyTicket)
 
-	fmt.Println("Event-Driven System is ready! Port: 8080")
-	fmt.Println("RabbitMQ Dashboard: http://localhost:15672")
-	http.ListenAndServe(":8080", r)
-}
+	// Start server with graceful shutdown
+	server := &http.Server{Addr: ":8080", Handler: r}
 
-func buyWithQueue(w http.ResponseWriter, r *http.Request) {
-	// STEP 1: Redis Check
-	newStock, _ := rdb.Decr(ctx, "ticket_stock:1").Result()
-	if newStock < 0 {
-		http.Error(w, "Tickets sold out!", http.StatusConflict)
-		return
-	}
-
-	// STEP 2: Add message to queue (async)
-	body := "1" // Selled ticket id
-	err := amqpChan.PublishWithContext(ctx, "", "ticket_queue", false, false, amqp.Publishing{
-		ContentType: "text/plain",
-		Body:        []byte(body),
-	})
-
-	if err != nil {
-		http.Error(w, "Queue error", 500)
-		return
-	}
-
-	w.Write([]byte("Your process added to queue. Ticket is getting ready!"))
-}
-
-func startDBWorker() {
-	msgs, _ := amqpChan.Consume("ticket_queue", "", true, false, false, false, nil)
-
-	for d := range msgs {
-		log.Printf("Message taken from queue: %s. DB updating...", d.Body)
-		_, err := db.Exec("UPDATE tickets SET stock = stock - 1 WHERE id = 1")
-		if err != nil {
-			log.Println("DB Hatası:", err)
+	go func() {
+		fmt.Println("Ultra-Fast Ticket System is live! Port: 8080")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Listen: %s\n", err)
 		}
-	}
-}
+	}()
 
-func initDBAndRedis() {
-	db, _ = sql.Open("postgres", "postgres://user:password@localhost:5434/ticket_db?sslmode=disable")
-	rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	// Wait for closing signal
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
 
-	// Initialize DB with redis at start
-	rdb.Set(ctx, "ticket_stock:1", 100, 0)
-	db.Exec("UPDATE tickets SET stock = 100 WHERE id = 1")
+	fmt.Println("System shutting down...")
+
+	// Wait 5 seconds to close connections safely
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server.Shutdown(shutdownCtx)
+	db.Close()
+	amqpChan.Close()
+
+	fmt.Println("System terminated succesfully!")
+
 }
